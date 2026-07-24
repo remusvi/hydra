@@ -4,5 +4,6 @@ version = "0.1.0"
 edition = "2024"
 
 [dependencies]
-iced-x86 = "1.21.0"
+#iced-x86 = "1.21.0"
 goblin = "0.9"
+capstone = "0.14.0"

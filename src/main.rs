@@ -1,173 +1,156 @@
-use std::{fs, path::PathBuf};
-use std::io;
-
-use goblin::Object;
-use iced_x86::{Decoder, DecoderOptions, Formatter, Instruction, NasmFormatter};
+use std::fs;
+use goblin::{Object, mach};
+use capstone::prelude::*;
 
 const HEXBYTES_COLUMN_BYTE_LENGTH: usize = 10;
 
-
 fn main() {
-    println!("Hello, world!");
-    let mut path = String::new();
-    path = String::from("/Users/adafaralph/dev/reverse_eng/hydra/dummy_binary/hello_x86.elf");
-
-    //io::stdin().read_line(&mut path);
-
-    //println!("DEBUG path bytes: {:?}", path.as_bytes());
-
-    let path = path.to_string();
-    let bitness: Option<u32> = Some(64);
-    dissassembly_test(path, bitness);
+    let path = String::from("/Users/adafaralph/dev/reverse_eng/hydra/dummy_binary/hello_arm64");
+    let is_aarch64 = true; // Set to true if targeting 64-bit ARM
+    let _ = disassembly_test(path, is_aarch64);
 }
 
-
-fn get_bin_starting_address(file_path: &str) -> Result<u64, Box<dyn std::error::Error>>{
+fn get_code_bounds(file_path: &str) -> Result<(u64, usize, usize), Box<dyn std::error::Error>> {
     let buf = fs::read(file_path)?;
 
     match Object::parse(&buf)? {
         Object::Elf(elf) => {
-            Ok(elf.entry)
-        }
-        Object::PE(pe) => {
-            let image_base = pe.image_base as u64;
-            Ok(image_base + pe.entry as u64)
+            let entry = elf.entry;
 
+            for ph in &elf.program_headers {
+                if ph.p_type == goblin::elf::program_header::PT_LOAD {
+                    let start_va = ph.p_vaddr;
+                    let end_va = ph.p_vaddr + ph.p_memsz;
+
+                    if (entry >= start_va && entry < end_va) || ((ph.p_flags & goblin::elf::program_header::PF_X) != 0) {
+                        if entry >= start_va && entry < end_va {
+                            let file_offset_adjustment = entry - start_va;
+                            return Ok((
+                                entry,
+                                (ph.p_offset + file_offset_adjustment) as usize,
+                                (ph.p_filesz - file_offset_adjustment) as usize,
+                            ));
+                        }
+                    }
+                }
+            }
+
+            for ph in &elf.program_headers {
+                if ph.p_type == goblin::elf::program_header::PT_LOAD
+                    && (ph.p_flags & goblin::elf::program_header::PF_X) != 0
+                {
+                    return Ok((ph.p_vaddr, ph.p_offset as usize, ph.p_filesz as usize));
+                }
+            }
+
+            Err("Could not find executable PT_LOAD segment".into())
         }
-        _ => Err("Unknown or unsupported object format".into())
+        Object::Mach(mach) => {
+            match mach {
+                    goblin::mach::Mach::Binary(macho) => {
+                            for segment in &macho.segments {
+                                if segment.name()? == "__TEXT" {
+                                    for section in segment.sections()? {
+                                        let (sec, _data) = section;
+                                        if sec.name()? == "__text" {
+                                            return Ok((
+                                                    sec.addr,
+                                                    sec.offset as usize,
+                                                    sec.size as usize,
+                                                ));
+                                        }
+                                    }
+                                    // Fallback to segment fields if __text section isn't explicitly found
+                                    return Ok((
+                                        segment.vmaddr,
+                                        segment.fileoff as usize,
+                                        segment.filesize as usize,
+                                    ));
+                                }
+                    }
+                    Err("Could not find __TEXT segment in Mach-O binary".into())
+                    }
+                    goblin::mach::Mach::Fat(_) => {
+                     Err("Fat Mach-O binaries require selecting a specific architecture slice".into())
+                }
+            }
+        }
+        _ => Err("Unsupported object format".into()),
     }
 }
 
-fn dissassembly_test(path: String, bit_type: Option<u32>) -> std::io::Result<()>{
-    println!("called dissassembly");
-    let bytes: Vec<u8> = match fs::read(&path) {
-            Ok(b) => b,
+fn disassembly_test(path: String, is_aarch64: bool) -> std::io::Result<()> {
+    println!("Called disassembly");
+    let bytes: Vec<u8> = fs::read(&path)?;
+
+
+    let (entry_va, file_offset, file_size) = match get_code_bounds(&path) {
+            Ok(res) => res,
             Err(e) => {
-                println!("Failed to read file: {e}");
-                return Err(e);
+                println!("Failed to parse binary bounds: {}", e); // Prints the exact string from Err(...)
+                return Err(std::io::Error::new(std::io::ErrorKind::InvalidData, e.to_string()));
             }
-    };
-    let bitness = bit_type.unwrap_or(64);
-    print!("getting starting addr");
-    let ip = get_bin_starting_address(&path).unwrap();
+        };
 
-    let mut line = String::new();
+    println!("entry va assinged");
 
-    let mut output: Vec<String>;
+    let is_thumb = (entry_va & 1) != 0;
 
-    print!("setting up formatter");
+    let clean_entry_va = entry_va & !1;
 
-    let mut formatter = NasmFormatter::new();
+    let cs = if is_aarch64 {
+            Capstone::new()
+                .arm64()
+                .mode(arch::arm64::ArchMode::Arm)
+                .detail(true)
+                .build()
+                .map_err(|e| std::io::Error::new(std::io::ErrorKind::Other, e.to_string()))?
+        } else if is_thumb {
+            Capstone::new()
+                .arm()
+                .mode(arch::arm::ArchMode::Thumb)
+                .detail(true)
+                .build()
+                .map_err(|e| std::io::Error::new(std::io::ErrorKind::Other, e.to_string()))?
+        } else {
+            Capstone::new()
+                .arm()
+                .mode(arch::arm::ArchMode::Arm)
+                .detail(true)
+                .build()
+                .map_err(|e| std::io::Error::new(std::io::ErrorKind::Other, e.to_string()))?
+        };
 
-    formatter.options_mut().set_digit_separator("`");
-    formatter.options_mut().set_first_operand_char_index(10);
+    println!("determineed bitness");
 
+    if file_offset + file_size > bytes.len() {
+        return Err(std::io::Error::new(std::io::ErrorKind::InvalidData, "Segment bounds exceed file size"));
+    }
 
-    let mut instruction = Instruction::default();
+    let code_bytes = &bytes[file_offset..file_offset + file_size];
+    let instructions = cs.disasm_all(code_bytes, entry_va)
+        .map_err(|e| std::io::Error::new(std::io::ErrorKind::Other, e.to_string()))?;
 
-    print!("gettind decoder");
-    let mut decoder = Decoder::with_ip(bitness, EXAMPLE_CODE, ip.clone(), DecoderOptions::NONE);
+   // print!("{}", instructions);
 
-    println!("starting decoding soon");
-    while decoder.can_decode() {
-        println!("decoding");
-        decoder.decode_out(&mut instruction);
+    for i in instructions.as_ref() {
+        print!("{:016X} ", i.address());
 
-        line.clear();
-        formatter.format(&instruction, &mut line);
-        print!("{:016X} ", instruction.ip());
-        let start_index = (instruction.ip() - &ip) as usize;
-        let instr_bytes = &bytes[start_index..start_index + instruction.len()];
+        let instr_bytes = i.bytes();
         for b in instr_bytes.iter() {
             print!("{:02X}", b);
         }
+
         if instr_bytes.len() < HEXBYTES_COLUMN_BYTE_LENGTH {
             for _ in 0..HEXBYTES_COLUMN_BYTE_LENGTH - instr_bytes.len() {
                 print!("  ");
             }
         }
-        println!(" {}", line);
+
+        let mnemonic = i.mnemonic().unwrap_or("");
+        let op_str = i.op_str().unwrap_or("");
+        println!(" {mnemonic} {op_str}");
     }
 
     Ok(())
 }
-
-
-
-// /*
-// This method produces the following output:
-// 00007FFAC46ACDA4 48895C2410           mov       [rsp+10h],rbx
-// 00007FFAC46ACDA9 4889742418           mov       [rsp+18h],rsi
-// 00007FFAC46ACDAE 55                   push      rbp
-// 00007FFAC46ACDAF 57                   push      rdi
-// 00007FFAC46ACDB0 4156                 push      r14
-// 00007FFAC46ACDB2 488DAC2400FFFFFF     lea       rbp,[rsp-100h]
-// 00007FFAC46ACDBA 4881EC00020000       sub       rsp,200h
-// 00007FFAC46ACDC1 488B0518570A00       mov       rax,[rel 7FFA`C475`24E0h]
-// 00007FFAC46ACDC8 4833C4               xor       rax,rsp
-// 00007FFAC46ACDCB 488985F0000000       mov       [rbp+0F0h],rax
-// 00007FFAC46ACDD2 4C8B052F240A00       mov       r8,[rel 7FFA`C474`F208h]
-// 00007FFAC46ACDD9 488D05787C0400       lea       rax,[rel 7FFA`C46F`4A58h]
-// 00007FFAC46ACDE0 33FF                 xor       edi,edi
-// */
-// #[allow(dead_code)]
-// pub(crate) fn how_to_disassemble() {
-//     let bytes = EXAMPLE_CODE;
-//     let mut decoder =
-//         Decoder::with_ip(EXAMPLE_CODE_BITNESS, bytes, EXAMPLE_CODE_RIP, DecoderOptions::NONE);
-
-//     // Formatters: Masm*, Nasm*, Gas* (AT&T) and Intel* (XED).
-//     // For fastest code, see `SpecializedFormatter` which is ~3.3x faster. Use it if formatting
-//     // speed is more important than being able to re-assemble formatted instructions.
-//     let mut formatter = NasmFormatter::new();
-
-//     // Change some options, there are many more
-//     formatter.options_mut().set_digit_separator("`");
-//     formatter.options_mut().set_first_operand_char_index(10);
-
-//     // String implements FormatterOutput
-//     let mut output = String::new();
-
-//     // Initialize this outside the loop because decode_out() writes to every field
-//     let mut instruction = Instruction::default();
-
-//     // The decoder also implements Iterator/IntoIterator so you could use a for loop:
-//     //      for instruction in &mut decoder { /* ... */ }
-//     // or collect():
-//     //      let instructions: Vec<_> = decoder.into_iter().collect();
-//     // but can_decode()/decode_out() is a little faster:
-//     while decoder.can_decode() {
-//         // There's also a decode() method that returns an instruction but that also
-//         // means it copies an instruction (40 bytes):
-//         //     instruction = decoder.decode();
-//         decoder.decode_out(&mut instruction);
-
-//         // Format the instruction ("disassemble" it)
-//         output.clear();
-//         formatter.format(&instruction, &mut output);
-
-//         // Eg. "00007FFAC46ACDB2 488DAC2400FFFFFF     lea       rbp,[rsp-100h]"
-//         print!("{:016X} ", instruction.ip());
-//         let start_index = (instruction.ip() - EXAMPLE_CODE_RIP) as usize;
-//         let instr_bytes = &bytes[start_index..start_index + instruction.len()];
-//         for b in instr_bytes.iter() {
-//             print!("{:02X}", b);
-//         }
-//         if instr_bytes.len() < HEXBYTES_COLUMN_BYTE_LENGTH {
-//             for _ in 0..HEXBYTES_COLUMN_BYTE_LENGTH - instr_bytes.len() {
-//                 print!("  ");
-//             }
-//         }
-//         println!(" {}", output);
-//     }
-// }
-
-// const HEXBYTES_COLUMN_BYTE_LENGTH: usize = 10;
-// const EXAMPLE_CODE_BITNESS: u32 = 64;
-const EXAMPLE_CODE_RIP: u64 = 0x0000_7FFA_C46A_CDA4;
-static EXAMPLE_CODE: &[u8] = &[
-    0x48, 0x89, 0x5C, 0x24, 0x10, 0x48, 0x89, 0x74, 0x24, 0x18, 0x55, 0x57, 0x41, 0x56, 0x48, 0x8D,
-    0xAC, 0x24, 0x00, 0xFF, 0xFF, 0xFF, 0x48, 0x81, 0xEC, 0x00, 0x02, 0x00, 0x00, 0x48, 0x8B, 0x05,
-    0x18, 0x57, 0x0A, 0x00, 0x48, 0x33, 0xC4, 0x48, 0x89, 0x85, 0xF0, 0x00, 0x00, 0x00, 0x4C, 0x8B,
-    0x05, 0x2F, 0x24, 0x0A, 0x00, 0x48, 0x8D, 0x05, 0x78, 0x7C, 0x04, 0x00, 0x33, 0xFF,
-];
